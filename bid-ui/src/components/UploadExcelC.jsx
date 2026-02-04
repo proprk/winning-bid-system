@@ -16,7 +16,7 @@ const VENDORS = [
     'Vitrina'
 ];
 
-function UploadExcel() {
+function UploadExcelC() {
     const [file, setFile] = useState(null);
     const [loading, setLoading] = useState(false);
     const [status, setStatus] = useState(null);
@@ -68,6 +68,9 @@ function UploadExcel() {
         try {
             const response = await fetch('http://localhost:3000/api/upload-excel', {
                 method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${localStorage.getItem('token')}`
+                },
                 body: formData,
             })
 
@@ -120,4 +123,4 @@ function UploadExcel() {
     )
 }
 
-export default UploadExcel
+export default UploadExcelC

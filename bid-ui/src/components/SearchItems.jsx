@@ -38,8 +38,11 @@ function SearchItems() {
 
         try {
             const response = await fetch(
-                `http://localhost:3000/api/items/search?${params.toString()}`
-            );
+                `http://localhost:3000/api/items/search?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${localStorage.getItem('token')}`
+                }
+            });
             const data = await response.json();
 
             if (!response.ok) {

@@ -14,7 +14,11 @@ function UploadHistory() {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
-        fetch('http://localhost:3000/api/upload-history')
+        fetch('http://localhost:3000/api/upload-history', {
+            headers: {
+                Authorization: `Bearer ${localStorage.getItem('token')}`
+            }
+        })
             .then(res => res.json())
             .then(data => {
                 setRows(data.results || []);

@@ -5,10 +5,15 @@ const multer = require('multer');
 const ExcelJS = require('exceljs');
 const fs = require('fs');
 const path = require('path');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
 
 // ================= APP SETUP =================
 const app = express();
 const PORT = 3000;
+
+app.use(express.json());
+
 
 // ================= DB CONNECTION =================
 const db = mysql.createPool({
@@ -21,7 +26,15 @@ const db = mysql.createPool({
 // ================= CORS (DEV ONLY) =================
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST');
+    res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Authorization'
+    );
+    res.setHeader(
+        'Access-Control-Allow-Methods',
+        'GET,POST,PUT,DELETE,OPTIONS'
+    );
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
@@ -90,32 +103,85 @@ async function isDuplicateProject(vendorId, projectName) {
     return rows.length > 0;
 }
 
-function getNumericValue(cellValue) {
-    if (cellValue === null || cellValue === undefined) return 0;
+function getNumericValue(cellValue, row, colIndex) {
+    // 🔁 If empty → try walking UP to find merged value
+    if (cellValue === null || cellValue === undefined) {
+        if (!row || !colIndex) return 0;
 
-    // If ExcelJS gives a number directly
+        let r = row.number - 1;
+        while (r >= 1) {
+            const above = row.worksheet.getRow(r).getCell(colIndex).value;
+            if (above !== null && above !== undefined && above !== '') {
+                return getNumericValue(above);
+            }
+            r--;
+        }
+        return 0;
+    }
+
+    // Direct number
     if (typeof cellValue === 'number') return cellValue;
 
-    // If it's an object (formula, rich text, etc.)
+    // Formula cell
     if (typeof cellValue === 'object') {
         if (typeof cellValue.result === 'number') {
             return cellValue.result;
         }
-        if (typeof cellValue.value === 'number') {
-            return cellValue.value;
-        }
+
         if (typeof cellValue.text === 'string') {
-            return parseFloat(cellValue.text.replace(/[^0-9.-]/g, '')) || 0;
+            return parseFloat(
+                cellValue.text.replace(/[^\d.-]/g, '')
+            ) || 0;
         }
     }
 
-    // If it's a string
+    // Currency / numeric string
     if (typeof cellValue === 'string') {
-        return parseFloat(cellValue.replace(/[^0-9.-]/g, '')) || 0;
+        return parseFloat(
+            cellValue.replace(/[^\d.-]/g, '')
+        ) || 0;
     }
 
     return 0;
 }
+
+
+function normalizeHeader(text) {
+    return text
+        .toString()
+        .replace(/\s+/g, ' ')
+        .replace(/\n/g, ' ')
+        .trim()
+        .toUpperCase();
+}
+
+function getHeaderMap(sheet) {
+    const headerRow = sheet.getRow(11);
+    const headerMap = {};
+
+    headerRow.eachCell((cell, colNumber) => {
+        if (!cell.value) return;
+
+        const normalized = normalizeHeader(cell.value);
+        headerMap[normalized] = colNumber;
+    });
+
+    return headerMap;
+}
+
+function getSafeCell(row, headerMap, headerName) {
+    const col = headerMap[headerName];
+    if (!col) return null; // header missing → safe ignore
+    return row.getCell(col)?.value ?? null;
+}
+
+function resolveHeader(headerMap, possibleNames) {
+    for (const name of possibleNames) {
+        if (headerMap[name]) return headerMap[name];
+    }
+    return null;
+}
+
 
 // ================= DB HELPERS =================
 async function getOrCreateVendor(vendorName) {
@@ -192,24 +258,64 @@ async function extractItemGroups(filePath, projectId) {
 
     const groups = {};
 
-    sheet.eachRow((row, rowNumber) => {
-        if (rowNumber < 12) return;
+    function isGroupLikeRow(row) {
+        const firstCell = row.getCell(1).value;
+        if (!firstCell) return false;
 
-        const a = row.getCell(1).value;
-        if (!a) return;
-
-        let isGroup = true;
         for (let c = 2; c <= 22; c++) {
             if (!isEffectivelyEmpty(row.getCell(c).value)) {
-                isGroup = false;
-                break;
+                return false;
             }
         }
+        return true;
+    }
 
-        if (isGroup) {
-            groups[rowNumber] = { name: a.toString().trim(), id: null };
+    function isItemRow(row) {
+        // Item rows must have Item Description + Size
+        const desc = row.getCell(1).value;
+        const size = row.getCell(2).value;
+        return !!(desc && size);
+    }
+
+    for (let rowNumber = 12; rowNumber <= sheet.rowCount; rowNumber++) {
+        const row = sheet.getRow(rowNumber);
+
+        if (!isGroupLikeRow(row)) continue;
+
+        // 🔍 Look ahead to find the next meaningful row
+        let nextRowNumber = rowNumber + 1;
+        let nextRow = null;
+
+        while (nextRowNumber <= sheet.rowCount) {
+            const candidate = sheet.getRow(nextRowNumber);
+
+            const hasAnyValue = candidate.values.some(
+                v => v !== null && v !== undefined && v !== ''
+            );
+
+            if (hasAnyValue) {
+                nextRow = candidate;
+                break;
+            }
+            nextRowNumber++;
         }
-    });
+
+        // ❌ No next meaningful row → ignore
+        if (!nextRow) continue;
+
+        // ❌ If next meaningful row is ALSO group-like → SUPER GROUP → IGNORE
+        if (isGroupLikeRow(nextRow)) {
+            continue;
+        }
+
+        // ✅ If next meaningful row is item → REAL GROUP
+        if (isItemRow(nextRow)) {
+            groups[rowNumber] = {
+                name: row.getCell(1).value.toString().trim(),
+                id: null
+            };
+        }
+    }
 
     return groups;
 }
@@ -226,87 +332,151 @@ async function insertGroups(groups, projectId) {
 }
 
 // ================= ITEMS =================
-async function insertItem({ vendorId, projectId, groupId, row }) {
+async function insertItem({ vendorId, projectId, groupId, row, headerMap }) {
     await db.query(
         `
-    INSERT INTO items (
-      vendor_id, project_id, group_id,
-      item_description, size, material, language, code_number,
-      distro_quantity, overage_quantity, total_print_quantity,
-      price_point, total_price,
-      category, max_order_quantity, reorder_trigger, reprint_quantity,
-      color, pantone, blockout, double_sided, same_or_different,
-      finishing, print_method, comments
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
+        INSERT INTO items (
+          vendor_id, project_id, group_id,
+          item_description, size, material, language, code_number,
+          distro_quantity, overage_quantity, total_print_quantity,
+          price_point, total_price,
+          category, max_order_quantity, reorder_trigger, reprint_quantity,
+          color, pantone, blockout, double_sided, same_or_different,
+          finishing, print_method, comments
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
         [
-            vendorId, projectId, groupId,
+            vendorId,
+            projectId,
+            groupId,
 
-            getCellText(row.getCell(1).value),
-            getCellText(row.getCell(2).value),
-            getCellText(row.getCell(3).value),
-            getCellText(row.getCell(4).value),
-            getCellText(row.getCell(5).value),
+            getCellText(getSafeCell(row, headerMap, 'ITEM DESCRIPTION')),
+            getCellText(
+                row.getCell(
+                    resolveHeader(headerMap, [
+                        'SIZE',
+                        'SIZE (W X H)',
+                        'SIZE(W X H)'
+                    ])
+                )?.value
+            ),
 
-            getNumericValue(row.getCell(6).value),   // distro_quantity
-            getNumericValue(row.getCell(7).value),   // overage_quantity
-            getNumericValue(row.getCell(8).value),   // total_print_quantity
-            getNumericValue(row.getCell(9).value),   // price_point
-            getNumericValue(row.getCell(10).value),  // total_price
+            getCellText(getSafeCell(row, headerMap, 'MATERIAL')),
+            getCellText(getSafeCell(row, headerMap, 'LANG')),
+            getCellText(getSafeCell(row, headerMap, 'CODE #')),
 
-            getCellText(row.getCell(11).value),
-            getNumericValue(row.getCell(12).value),
-            getNumericValue(row.getCell(13).value),
-            getNumericValue(row.getCell(14).value),
+            getNumericValue(getSafeCell(row, headerMap, 'DISTRO QUANTITY')),
+            getNumericValue(getSafeCell(row, headerMap, 'OVERAGE QUANTITY')),
+            getNumericValue(getSafeCell(row, headerMap, 'TOTAL PRINT QUANTITY')),
+            getNumericValue(
+                getSafeCell(row, headerMap, 'PRICE POINT ENTERED ON MASTER'),
+                row,
+                headerMap['PRICE POINT ENTERED ON MASTER']
+            ),
 
-            getCellText(row.getCell(15).value),
-            getCellText(row.getCell(16).value),
-            getCellText(row.getCell(17).value),
-            getCellText(row.getCell(18).value),
-            getCellText(row.getCell(19).value),
+            getNumericValue(getSafeCell(row, headerMap, 'TOTAL PRICE'), row, headerMap['TOTAL PRICE']),
 
-            getCellText(row.getCell(20).value),
-            getCellText(row.getCell(21).value),
-            getCellText(row.getCell(22).value)
+            getCellText(getSafeCell(row, headerMap, 'CATEGORY')),
+            getNumericValue(getSafeCell(row, headerMap, 'MAX ORDER QUANTITY')),
+            getNumericValue(getSafeCell(row, headerMap, 'REORDER TRIGGER')),
+            getNumericValue(getSafeCell(row, headerMap, 'REPRINT QUANTITY')),
+
+            getCellText(getSafeCell(row, headerMap, 'COLOR')),
+            getCellText(getSafeCell(row, headerMap, 'PANTONE')),
+            getCellText(getSafeCell(row, headerMap, 'BLOCKOUT')),
+            getCellText(getSafeCell(row, headerMap, 'DOUBLE SIDED')),
+            getCellText(getSafeCell(row, headerMap, 'SAME OR DIFFERENT')),
+
+            getCellText(getSafeCell(row, headerMap, 'FINISHING')),
+            getCellText(getSafeCell(row, headerMap, 'PRINT METHOD')),
+            getCellText(getSafeCell(row, headerMap, 'COMMENTS'))
         ]
     );
 }
+
 
 async function extractAndInsertItems({ filePath, vendorId, projectId, groups }) {
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.readFile(filePath);
     const sheet = workbook.worksheets[0];
 
+    const headerMap = getHeaderMap(sheet);
+    console.log("headerMap: ", headerMap);
     let currentGroupId = null;
 
-    sheet.eachRow((row, rowNumber) => {
+    for (let rowNumber = 12; rowNumber <= sheet.rowCount; rowNumber++) {
+        const row = sheet.getRow(rowNumber);
+
+        // If this row is a real group
         if (groups[rowNumber]) {
             currentGroupId = groups[rowNumber].id;
-            return;
+            continue;
         }
-        if (!currentGroupId || rowNumber < 12) return;
 
-        const desc = getCellText(row.getCell(1).value);
-        const size = getCellText(row.getCell(2).value);
-        if (!desc || !size) return;
+        if (!currentGroupId) continue;
 
-        insertItem({ vendorId, projectId, groupId: currentGroupId, row });
-    });
+        const desc = getCellText(
+            getSafeCell(row, headerMap, 'ITEM DESCRIPTION')
+        );
+
+        const size = getCellText(
+            row.getCell(
+                resolveHeader(headerMap, [
+                    'SIZE',
+                    'SIZE (W X H)',
+                    'SIZE(W X H)'
+                ])
+            )?.value
+        );
+
+        // Skip empty / separator rows
+        if (!desc || !size) continue;
+
+        // ✅ THIS IS THE IMPORTANT PART
+        await insertItem({
+            vendorId,
+            projectId,
+            groupId: currentGroupId,
+            row,
+            headerMap
+        });
+    }
+}
+
+
+// ================= AUTH with JWT=================
+
+function authenticateJWT(req, res, next) {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) {
+        return res.status(401).json({ error: 'Token missing' });
+    }
+
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+        return res.status(401).json({ error: 'Invalid token format' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.user = decoded; // { userId, role }
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+    }
 }
 
 // ================= ROUTES =================
 
 // ================= Upload Excel =================
-app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
+app.post('/api/upload-excel', authenticateJWT, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({
                 error: 'No file received. Please upload a valid Excel file.'
             });
         }
-
-        console.log('req.file:', req.file);
-        console.log('req.body:', req.body);
 
         const filePath = req.file.path;
         const originalName = req.file.originalname;
@@ -359,7 +529,7 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
 });
 
 // ================= Upload Hiatory =================
-app.get('/api/upload-history', async (req, res) => {
+app.get('/api/upload-history', authenticateJWT, async (req, res) => {
     try {
         const [rows] = await db.query(
             `
@@ -387,7 +557,7 @@ app.get('/api/upload-history', async (req, res) => {
 
 // ================= Search Items =================
 
-app.get('/api/items/search', async (req, res) => {
+app.get('/api/items/search', authenticateJWT, async (req, res) => {
     const {
         q,
         size,
@@ -488,6 +658,55 @@ app.get('/api/items/search', async (req, res) => {
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Search failed' });
+    }
+});
+
+const JWT_SECRET = 'super-secret-internal-key';
+
+
+// ================= AUTH Login =================
+app.post('/api/auth/login', async (req, res) => {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Email and password required' });
+    }
+
+    try {
+        const [rows] = await db.query(
+            'SELECT * FROM users WHERE email = ? AND is_active = true',
+            [email]
+        );
+
+        if (!rows.length) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const user = rows[0];
+
+        const isMatch = await bcrypt.compare(password, user.password_hash);
+        if (!isMatch) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign(
+            { userId: user.id, role: user.role },
+            JWT_SECRET,
+            { expiresIn: '8h' }
+        );
+
+        res.json({
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                role: user.role
+            }
+        });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Login failed' });
     }
 });
 
