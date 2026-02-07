@@ -7,6 +7,7 @@ import Dashboard from './pages/Dashboard';
 import UploadExcel from './pages/UploadExcel';
 import UploadHistory from './pages/UploadHistory';
 import SearchItems from './pages/SearchItems';
+import ProjectDetails from './pages/ProjectDetails';
 
 function App() {
   return (
@@ -26,6 +27,7 @@ function App() {
         <Route path="upload" element={<UploadExcel />} />
         <Route path="history" element={<UploadHistory />} />
         <Route path="search" element={<SearchItems />} />
+        <Route path="projects/:projectId" element={<ProjectDetails />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/login" />} />

@@ -8,6 +8,9 @@ const path = require('path');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 
+
+const JWT_SECRET = 'super-secret-internal-key';
+
 // ================= APP SETUP =================
 const app = express();
 const PORT = 3000;
@@ -394,7 +397,7 @@ async function insertItem({ vendorId, projectId, groupId, row, headerMap }) {
     );
 }
 
-
+// ================= EXTRACT & INSERT ITEMS =================
 async function extractAndInsertItems({ filePath, vendorId, projectId, groups }) {
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.readFile(filePath);
@@ -555,8 +558,127 @@ app.get('/api/upload-history', authenticateJWT, async (req, res) => {
     }
 });
 
-// ================= Search Items =================
+// ================= Delete Project =================
+app.delete('/api/projects/:projectId', authenticateJWT,
+    async (req, res) => {
+        const { projectId } = req.params;
 
+        const conn = await db.getConnection();
+        try {
+            await conn.beginTransaction();
+
+            // 1. Delete items
+            await conn.query(
+                'DELETE FROM items WHERE project_id = ?',
+                [projectId]
+            );
+
+            // 2. Delete groups
+            await conn.query(
+                'DELETE FROM item_groups WHERE project_id = ?',
+                [projectId]
+            );
+
+            // 3. Delete project
+            const [result] = await conn.query(
+                'DELETE FROM projects WHERE id = ?',
+                [projectId]
+            );
+
+            await conn.commit();
+
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Project not found' });
+            }
+
+            res.json({ message: 'Project deleted successfully' });
+
+        } catch (err) {
+            await conn.rollback();
+            console.error(err);
+            res.status(500).json({ error: 'Failed to delete project' });
+        } finally {
+            conn.release();
+        }
+    }
+);
+
+// ================= Get Project Details =================
+app.get(
+    '/api/projects/:projectId',
+    authenticateJWT,
+    async (req, res) => {
+        const { projectId } = req.params;
+
+        try {
+            const [rows] = await db.query(
+                `
+        SELECT
+          project_name,
+          ship_date,
+          arrival_date,
+          ship_method,
+          live_date,
+          down_date,
+          discard_date,
+          overage_ship_date,
+          graphic_notes
+        FROM projects
+        WHERE id = ?
+        `,
+                [projectId]
+            );
+
+            if (!rows.length) {
+                return res.status(404).json({ error: 'Project not found' });
+            }
+
+            res.json(rows[0]);
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: 'Failed to fetch project details' });
+        }
+    }
+);
+
+// ================= Project Items =================
+app.get(
+    '/api/projects/:projectId/items',
+    authenticateJWT,
+    async (req, res) => {
+        const { projectId } = req.params;
+
+        try {
+            const [rows] = await db.query(
+                `
+        SELECT
+          item_description,
+          size,
+          material,
+          price_point,
+          total_print_quantity,
+          total_price
+        FROM items
+        WHERE project_id = ?
+        ORDER BY item_description
+        `,
+                [projectId]
+            );
+
+            res.json({
+                count: rows.length,
+                results: rows
+            });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: 'Failed to fetch project items' });
+        }
+    }
+);
+
+
+
+// ================= Search Items =================
 app.get('/api/items/search', authenticateJWT, async (req, res) => {
     const {
         q,
@@ -660,8 +782,6 @@ app.get('/api/items/search', authenticateJWT, async (req, res) => {
         res.status(500).json({ error: 'Search failed' });
     }
 });
-
-const JWT_SECRET = 'super-secret-internal-key';
 
 
 // ================= AUTH Login =================
